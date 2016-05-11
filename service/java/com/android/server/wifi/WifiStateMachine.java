@@ -5062,9 +5062,14 @@ public class WifiStateMachine extends StateMachine implements WifiNative.WifiPno
 
 
     private boolean useLegacyDhcpClient() {
-        return Settings.Global.getInt(
-                mContext.getContentResolver(),
-                Settings.Global.LEGACY_DHCP_CLIENT, 0) == 1;
+//+++
+        //Always use legacy dhcpclient on xoom as new failes to receive ip address
+        return true;
+//===
+//        return Settings.Global.getInt(
+//                mContext.getContentResolver(),
+//                Settings.Global.LEGACY_DHCP_CLIENT, 0) == 1;
+//---
     }
 
     private void maybeInitDhcpStateMachine() {
