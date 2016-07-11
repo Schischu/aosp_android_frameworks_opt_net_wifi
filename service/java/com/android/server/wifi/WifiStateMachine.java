@@ -8210,6 +8210,11 @@ public class WifiStateMachine extends StateMachine implements WifiNative.WifiPno
             // cause the roam to faile and the device to disconnect
             clearCurrentConfigBSSID("L2ConnectedState");
 
+//+++>
+            // wifi: Bring back mIsWiFiIpReachabilityEnabled check
+            // http://review.cyanogenmod.org/#/c/150666/
+            if (mIsWiFiIpReachabilityEnabled) {
+//===>
             try {
                 mIpReachabilityMonitor = new IpReachabilityMonitor(
                         mContext,
@@ -8223,6 +8228,9 @@ public class WifiStateMachine extends StateMachine implements WifiNative.WifiPno
             } catch (IllegalArgumentException e) {
                 Log.wtf("Failed to create IpReachabilityMonitor", e);
             }
+//+++>
+            }
+//===>
         }
 
         @Override
