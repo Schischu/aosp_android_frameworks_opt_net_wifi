@@ -36,6 +36,7 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.UserInfo;
 import android.database.ContentObserver;
@@ -70,6 +71,7 @@ import android.os.Looper;
 import android.os.Message;
 import android.os.Messenger;
 import android.os.PowerManager;
+import android.os.Process;
 import android.os.RemoteException;
 import android.os.ResultReceiver;
 import android.os.SystemClock;
@@ -130,15 +132,6 @@ public class WifiServiceImpl extends IWifiManager.Stub {
     private final Context mContext;
     private final FrameworkFacade mFacade;
 
-    final LockList mLocks = new LockList();
-    // some wifi lock statistics
-    private int mFullHighPerfLocksAcquired;
-    private int mFullHighPerfLocksReleased;
-    private int mFullLocksAcquired;
-    private int mFullLocksReleased;
-    private int mScanLocksAcquired;
-    private int mScanLocksReleased;
-
     private final List<Multicaster> mMulticasters =
             new ArrayList<Multicaster>();
     private int mMulticastEnabled;
@@ -168,6 +161,8 @@ public class WifiServiceImpl extends IWifiManager.Stub {
      * Asynchronous channel to WifiStateMachine
      */
     private AsyncChannel mWifiStateMachineChannel;
+
+    private final boolean mPermissionReviewRequired;
 
     /**
      * Handles client connections
@@ -317,6 +312,7 @@ public class WifiServiceImpl extends IWifiManager.Stub {
     WifiStateMachineHandler mWifiStateMachineHandler;
 
     private WifiController mWifiController;
+    private final WifiLockManager mWifiLockManager;
 
     public WifiServiceImpl(Context context) {
         mContext = context;
@@ -349,10 +345,17 @@ public class WifiServiceImpl extends IWifiManager.Stub {
         mNotificationController = new WifiNotificationController(mContext,
                 wifiThread.getLooper(), mWifiStateMachine, mFacade, null);
 
+        mWifiLockManager = new WifiLockManager(mContext, mBatteryStats);
         mClientHandler = new ClientHandler(wifiThread.getLooper());
         mWifiStateMachineHandler = new WifiStateMachineHandler(wifiThread.getLooper());
         mWifiController = new WifiController(mContext, mWifiStateMachine,
-                mSettingsStore, mLocks, wifiThread.getLooper(), mFacade);
+                mSettingsStore, mWifiLockManager, wifiThread.getLooper(), mFacade);
+        // Set the WifiController for WifiLastResortWatchdog
+        mWifiInjector.getWifiLastResortWatchdog().setWifiController(mWifiController);
+
+        mPermissionReviewRequired = Build.PERMISSIONS_REVIEW_REQUIRED
+                || context.getResources().getBoolean(
+                com.android.internal.R.bool.config_permissionReviewRequired);
     }
 
 
@@ -391,9 +394,12 @@ public class WifiServiceImpl extends IWifiManager.Stub {
                         String state = intent.getStringExtra(IccCardConstants.INTENT_KEY_ICC_STATE);
                         if (IccCardConstants.INTENT_VALUE_ICC_ABSENT.equals(state)) {
                             Log.d(TAG, "resetting networks because SIM was removed");
-                            mWifiStateMachine.resetSimAuthNetworks();
+                            mWifiStateMachine.resetSimAuthNetworks(false);
                             Log.d(TAG, "resetting country code because SIM is removed");
                             mCountryCode.simCardRemoved();
+                        } else if (IccCardConstants.INTENT_VALUE_ICC_LOADED.equals(state)) {
+                            Log.d(TAG, "resetting networks because SIM was loaded");
+                            mWifiStateMachine.resetSimAuthNetworks(true);
                         }
                     }
                 },
@@ -410,7 +416,13 @@ public class WifiServiceImpl extends IWifiManager.Stub {
 
         // If we are already disabled (could be due to airplane mode), avoid changing persist
         // state here
-        if (wifiEnabled) setWifiEnabled(wifiEnabled);
+        if (wifiEnabled) {
+            try {
+                setWifiEnabled(mContext.getPackageName(), wifiEnabled);
+            } catch (RemoteException e) {
+                /* ignore - local call */
+            }
+        }
     }
 
     public void handleUserSwitch(int userId) {
@@ -549,7 +561,8 @@ public class WifiServiceImpl extends IWifiManager.Stub {
      * @return {@code true} if the enable/disable operation was
      *         started or is already in the queue.
      */
-    public synchronized boolean setWifiEnabled(boolean enable) {
+    public synchronized boolean setWifiEnabled(String packageName, boolean enable)
+            throws RemoteException {
         enforceChangePermission();
         Slog.d(TAG, "setWifiEnabled: " + enable + " pid=" + Binder.getCallingPid()
                     + ", uid=" + Binder.getCallingUid());
@@ -558,7 +571,6 @@ public class WifiServiceImpl extends IWifiManager.Stub {
         * Caller might not have WRITE_SECURE_SETTINGS,
         * only CHANGE_WIFI_STATE is enforced
         */
-
         long ident = Binder.clearCallingIdentity();
         try {
             if (! mSettingsStore.handleWifiToggled(enable)) {
@@ -567,6 +579,26 @@ public class WifiServiceImpl extends IWifiManager.Stub {
             }
         } finally {
             Binder.restoreCallingIdentity(ident);
+        }
+
+
+        if (mPermissionReviewRequired) {
+            final int wiFiEnabledState = getWifiEnabledState();
+            if (enable) {
+                if (wiFiEnabledState == WifiManager.WIFI_STATE_DISABLING
+                        || wiFiEnabledState == WifiManager.WIFI_STATE_DISABLED) {
+                    if (startConsentUi(packageName, Binder.getCallingUid(),
+                            WifiManager.ACTION_REQUEST_ENABLE)) {
+                        return true;
+                    }
+                }
+            } else if (wiFiEnabledState == WifiManager.WIFI_STATE_ENABLING
+                    || wiFiEnabledState == WifiManager.WIFI_STATE_ENABLED) {
+                if (startConsentUi(packageName, Binder.getCallingUid(),
+                        WifiManager.ACTION_REQUEST_DISABLE)) {
+                    return true;
+                }
+            }
         }
 
         mWifiController.sendMessage(CMD_WIFI_TOGGLED);
@@ -798,6 +830,21 @@ public class WifiServiceImpl extends IWifiManager.Stub {
         } else {
             Slog.e(TAG, "mWifiStateMachineChannel is not initialized");
             return null;
+        }
+    }
+
+    /**
+     * see {@link android.net.wifi.WifiManager#getHasCarrierNetworks()}
+     * @return if Carrier Networks have been configured
+     */
+    public boolean hasCarrierConfiguredNetworks() {
+        enforceAccessPermission();
+        if (mWifiStateMachineChannel != null) {
+            return mWifiStateMachine.syncHasCarrierConfiguredNetworks(Binder.getCallingUid(),
+                    mWifiStateMachineChannel);
+        } else {
+            Slog.e(TAG, "mWifiStateMachineChannel is not initialized");
+            return false;
         }
     }
 
@@ -1129,11 +1176,13 @@ public class WifiServiceImpl extends IWifiManager.Stub {
 
      /**
      * Get the country code
-     * @return ISO 3166 country code.
+     * @return Get the best choice country code for wifi, regardless of if it was set or
+     * not.
+     * Returns null when there is no country code available.
      */
     public String getCountryCode() {
         enforceConnectivityInternalPermission();
-        String country = mCountryCode.getCurrentCountryCode();
+        String country = mCountryCode.getCountryCode();
         return country;
     }
     /**
@@ -1384,6 +1433,34 @@ public class WifiServiceImpl extends IWifiManager.Stub {
         }
     };
 
+    private boolean startConsentUi(String packageName,
+            int callingUid, String intentAction) throws RemoteException {
+        if (UserHandle.getAppId(callingUid) == Process.SYSTEM_UID) {
+            return false;
+        }
+        try {
+            // Validate the package only if we are going to use it
+            ApplicationInfo applicationInfo = mContext.getPackageManager()
+                    .getApplicationInfoAsUser(packageName,
+                            PackageManager.MATCH_DEBUG_TRIAGED_MISSING,
+                            UserHandle.getUserId(callingUid));
+            if (applicationInfo.uid != callingUid) {
+                throw new SecurityException("Package " + callingUid
+                        + " not in uid " + callingUid);
+            }
+
+            // Permission review mode, trigger a user prompt
+            Intent intent = new Intent(intentAction);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                    | Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS);
+            intent.putExtra(Intent.EXTRA_PACKAGE_NAME, packageName);
+            mContext.startActivity(intent);
+            return true;
+        } catch (PackageManager.NameNotFoundException e) {
+            throw new RemoteException(e.getMessage());
+        }
+    }
+
     /**
      * Observes settings changes to scan always mode.
      */
@@ -1510,16 +1587,9 @@ public class WifiServiceImpl extends IWifiManager.Stub {
                 }
             }
             pw.println();
-            pw.println("Locks acquired: " + mFullLocksAcquired + " full, " +
-                    mFullHighPerfLocksAcquired + " full high perf, " +
-                    mScanLocksAcquired + " scan");
-            pw.println("Locks released: " + mFullLocksReleased + " full, " +
-                    mFullHighPerfLocksReleased + " full high perf, " +
-                    mScanLocksReleased + " scan");
-            pw.println();
             pw.println("Locks held:");
-            mLocks.dump(pw);
-
+            mWifiLockManager.dump(pw);
+            pw.println();
             pw.println("Multicast Locks held:");
             for (Multicaster l : mMulticasters) {
                 pw.print("    ");
@@ -1532,251 +1602,35 @@ public class WifiServiceImpl extends IWifiManager.Stub {
         }
     }
 
-    private class WifiLock extends DeathRecipient {
-        int mMode;
-        WorkSource mWorkSource;
-
-        WifiLock(int lockMode, String tag, IBinder binder, WorkSource ws) {
-            super(tag, binder);
-            mMode = lockMode;
-            mWorkSource = ws;
-        }
-
-        public void binderDied() {
-            synchronized (mLocks) {
-                releaseWifiLockLocked(mBinder);
-            }
-        }
-
-        public String toString() {
-            return "WifiLock{" + mTag + " type=" + mMode + " uid=" + mUid + "}";
-        }
-    }
-
-    public class LockList {
-        private List<WifiLock> mList;
-
-        private LockList() {
-            mList = new ArrayList<WifiLock>();
-        }
-
-        synchronized boolean hasLocks() {
-            return !mList.isEmpty();
-        }
-
-        synchronized int getStrongestLockMode() {
-            if (mList.isEmpty()) {
-                return WifiManager.WIFI_MODE_FULL;
-            }
-
-            if (mFullHighPerfLocksAcquired > mFullHighPerfLocksReleased) {
-                return WifiManager.WIFI_MODE_FULL_HIGH_PERF;
-            }
-
-            if (mFullLocksAcquired > mFullLocksReleased) {
-                return WifiManager.WIFI_MODE_FULL;
-            }
-
-            return WifiManager.WIFI_MODE_SCAN_ONLY;
-        }
-
-        synchronized void updateWorkSource(WorkSource ws) {
-            for (int i = 0; i < mLocks.mList.size(); i++) {
-                ws.add(mLocks.mList.get(i).mWorkSource);
-            }
-        }
-
-        private void addLock(WifiLock lock) {
-            if (findLockByBinder(lock.mBinder) < 0) {
-                mList.add(lock);
-            }
-        }
-
-        private WifiLock removeLock(IBinder binder) {
-            int index = findLockByBinder(binder);
-            if (index >= 0) {
-                WifiLock ret = mList.remove(index);
-                ret.unlinkDeathRecipient();
-                return ret;
-            } else {
-                return null;
-            }
-        }
-
-        private int findLockByBinder(IBinder binder) {
-            int size = mList.size();
-            for (int i = size - 1; i >= 0; i--) {
-                if (mList.get(i).mBinder == binder)
-                    return i;
-            }
-            return -1;
-        }
-
-        private void dump(PrintWriter pw) {
-            for (WifiLock l : mList) {
-                pw.print("    ");
-                pw.println(l);
-            }
-        }
-    }
-
-    void enforceWakeSourcePermission(int uid, int pid) {
-        if (uid == android.os.Process.myUid()) {
-            return;
-        }
-        mContext.enforcePermission(android.Manifest.permission.UPDATE_DEVICE_STATS,
-                pid, uid, null);
-    }
-
+    @Override
     public boolean acquireWifiLock(IBinder binder, int lockMode, String tag, WorkSource ws) {
-        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.WAKE_LOCK, null);
-        if (lockMode != WifiManager.WIFI_MODE_FULL &&
-                lockMode != WifiManager.WIFI_MODE_SCAN_ONLY &&
-                lockMode != WifiManager.WIFI_MODE_FULL_HIGH_PERF) {
-            Slog.e(TAG, "Illegal argument, lockMode= " + lockMode);
-            if (DBG) throw new IllegalArgumentException("lockMode=" + lockMode);
-            return false;
-        }
-        if (ws != null && ws.size() == 0) {
-            ws = null;
-        }
-        if (ws != null) {
-            enforceWakeSourcePermission(Binder.getCallingUid(), Binder.getCallingPid());
-        }
-        if (ws == null) {
-            ws = new WorkSource(Binder.getCallingUid());
-        }
-        WifiLock wifiLock = new WifiLock(lockMode, tag, binder, ws);
-        synchronized (mLocks) {
-            return acquireWifiLockLocked(wifiLock);
-        }
-    }
-
-    private void noteAcquireWifiLock(WifiLock wifiLock) throws RemoteException {
-        switch(wifiLock.mMode) {
-            case WifiManager.WIFI_MODE_FULL:
-            case WifiManager.WIFI_MODE_FULL_HIGH_PERF:
-            case WifiManager.WIFI_MODE_SCAN_ONLY:
-                mBatteryStats.noteFullWifiLockAcquiredFromSource(wifiLock.mWorkSource);
-                break;
-        }
-    }
-
-    private void noteReleaseWifiLock(WifiLock wifiLock) throws RemoteException {
-        switch(wifiLock.mMode) {
-            case WifiManager.WIFI_MODE_FULL:
-            case WifiManager.WIFI_MODE_FULL_HIGH_PERF:
-            case WifiManager.WIFI_MODE_SCAN_ONLY:
-                mBatteryStats.noteFullWifiLockReleasedFromSource(wifiLock.mWorkSource);
-                break;
-        }
-    }
-
-    private boolean acquireWifiLockLocked(WifiLock wifiLock) {
-        if (DBG) Slog.d(TAG, "acquireWifiLockLocked: " + wifiLock);
-
-        mLocks.addLock(wifiLock);
-
-        long ident = Binder.clearCallingIdentity();
-        try {
-            noteAcquireWifiLock(wifiLock);
-            switch(wifiLock.mMode) {
-            case WifiManager.WIFI_MODE_FULL:
-                ++mFullLocksAcquired;
-                break;
-            case WifiManager.WIFI_MODE_FULL_HIGH_PERF:
-                ++mFullHighPerfLocksAcquired;
-                break;
-
-            case WifiManager.WIFI_MODE_SCAN_ONLY:
-                ++mScanLocksAcquired;
-                break;
-            }
+        if (mWifiLockManager.acquireWifiLock(lockMode, tag, binder, ws)) {
             mWifiController.sendMessage(CMD_LOCKS_CHANGED);
             return true;
-        } catch (RemoteException e) {
-            return false;
-        } finally {
-            Binder.restoreCallingIdentity(ident);
         }
+        return false;
     }
 
-    public void updateWifiLockWorkSource(IBinder lock, WorkSource ws) {
-        int uid = Binder.getCallingUid();
-        int pid = Binder.getCallingPid();
-        if (ws != null && ws.size() == 0) {
-            ws = null;
-        }
-        if (ws != null) {
-            enforceWakeSourcePermission(uid, pid);
-        }
-        long ident = Binder.clearCallingIdentity();
-        try {
-            synchronized (mLocks) {
-                int index = mLocks.findLockByBinder(lock);
-                if (index < 0) {
-                    throw new IllegalArgumentException("Wifi lock not active");
-                }
-                WifiLock wl = mLocks.mList.get(index);
-                noteReleaseWifiLock(wl);
-                wl.mWorkSource = ws != null ? new WorkSource(ws) : new WorkSource(uid);
-                noteAcquireWifiLock(wl);
-            }
-        } catch (RemoteException e) {
-        } finally {
-            Binder.restoreCallingIdentity(ident);
-        }
+    @Override
+    public void updateWifiLockWorkSource(IBinder binder, WorkSource ws) {
+        mWifiLockManager.updateWifiLockWorkSource(binder, ws);
     }
 
-    public boolean releaseWifiLock(IBinder lock) {
-        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.WAKE_LOCK, null);
-        synchronized (mLocks) {
-            return releaseWifiLockLocked(lock);
+    @Override
+    public boolean releaseWifiLock(IBinder binder) {
+        if (mWifiLockManager.releaseWifiLock(binder)) {
+            mWifiController.sendMessage(CMD_LOCKS_CHANGED);
+            return true;
         }
+        return false;
     }
 
-    private boolean releaseWifiLockLocked(IBinder lock) {
-        boolean hadLock;
-
-        WifiLock wifiLock = mLocks.removeLock(lock);
-
-        if (DBG) Slog.d(TAG, "releaseWifiLockLocked: " + wifiLock);
-
-        hadLock = (wifiLock != null);
-
-        long ident = Binder.clearCallingIdentity();
-        try {
-            if (hadLock) {
-                noteReleaseWifiLock(wifiLock);
-                switch(wifiLock.mMode) {
-                    case WifiManager.WIFI_MODE_FULL:
-                        ++mFullLocksReleased;
-                        break;
-                    case WifiManager.WIFI_MODE_FULL_HIGH_PERF:
-                        ++mFullHighPerfLocksReleased;
-                        break;
-                    case WifiManager.WIFI_MODE_SCAN_ONLY:
-                        ++mScanLocksReleased;
-                        break;
-                }
-                mWifiController.sendMessage(CMD_LOCKS_CHANGED);
-            }
-        } catch (RemoteException e) {
-        } finally {
-            Binder.restoreCallingIdentity(ident);
-        }
-
-        return hadLock;
-    }
-
-    private abstract class DeathRecipient
-            implements IBinder.DeathRecipient {
+    private class Multicaster implements IBinder.DeathRecipient {
         String mTag;
         int mUid;
         IBinder mBinder;
 
-        DeathRecipient(String tag, IBinder binder) {
-            super();
+        Multicaster(String tag, IBinder binder) {
             mTag = tag;
             mUid = Binder.getCallingUid();
             mBinder = binder;
@@ -1787,20 +1641,7 @@ public class WifiServiceImpl extends IWifiManager.Stub {
             }
         }
 
-        void unlinkDeathRecipient() {
-            mBinder.unlinkToDeath(this, 0);
-        }
-
-        public int getUid() {
-            return mUid;
-        }
-    }
-
-    private class Multicaster extends DeathRecipient {
-        Multicaster(String tag, IBinder binder) {
-            super(tag, binder);
-        }
-
+        @Override
         public void binderDied() {
             Slog.e(TAG, "Multicaster binderDied");
             synchronized (mMulticasters) {
@@ -1809,6 +1650,14 @@ public class WifiServiceImpl extends IWifiManager.Stub {
                     removeMulticasterLocked(i, mUid);
                 }
             }
+        }
+
+        void unlinkDeathRecipient() {
+            mBinder.unlinkToDeath(this, 0);
+        }
+
+        public int getUid() {
+            return mUid;
         }
 
         public String toString() {
@@ -1899,6 +1748,7 @@ public class WifiServiceImpl extends IWifiManager.Stub {
     public void enableVerboseLogging(int verbose) {
         enforceAccessPermission();
         mWifiStateMachine.enableVerboseLogging(verbose);
+        mWifiLockManager.enableVerboseLogging(verbose);
     }
 
     public int getVerboseLoggingLevel() {
@@ -1962,7 +1812,11 @@ public class WifiServiceImpl extends IWifiManager.Stub {
 
         if (!mUserManager.hasUserRestriction(UserManager.DISALLOW_CONFIG_WIFI)) {
             // Enable wifi
-            setWifiEnabled(true);
+            try {
+                setWifiEnabled(mContext.getOpPackageName(), true);
+            } catch (RemoteException e) {
+                /* ignore - local call */
+            }
             // Delete all Wifi SSIDs
             List<WifiConfiguration> networks = getConfiguredNetworks();
             if (networks != null) {
